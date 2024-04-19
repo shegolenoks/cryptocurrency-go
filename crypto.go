@@ -1,128 +1,134 @@
-package main
+package blockchain
 
 import (
-	bc "./blockchain"
-	nt "./network"
-	"encoding/json"
+	"bytes"
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/binary"
 	"fmt"
-	"os"
-	"strings"
+	"math"
+	"math/big"
+	mrand "math/rand"
 )
 
-func init() {
-	if len(os.Args) < 2 {
-		panic("failed: len(os.Args) < 2")
-	}
-	var (
-		serveStr     = ""
-		addrStr      = ""
-		userNewStr   = ""
-		userLoadStr  = ""
-		chainNewStr  = ""
-		chainLoadStr = ""
-	)
-	var (
-		serveExist     = false
-		addrExist      = false
-		userNewExist   = false
-		userLoadExist  = false
-		chainNewExist  = false
-		chainLoadExist = false
-	)
-	for i := 1; i < len(os.Args); i++ {
-		arg := os.Args[i]
-		switch {
-		case strings.HasPrefix(arg, "-serve:"):
-			serveStr = strings.Replace(arg, "-serve:", "", 1)
-			serveExist = true
-		case strings.HasPrefix(arg, "-loadaddr:"):
-			addrStr = strings.Replace(arg, "-loadaddr:", "", 1)
-			addrExist = true
-		case strings.HasPrefix(arg, "-newuser:"):
-			userNewStr = strings.Replace(arg, "-newuser:", "", 1)
-			userNewExist = true
-		case strings.HasPrefix(arg, "-loaduser:"):
-			userLoadStr = strings.Replace(arg, "-loaduser:", "", 1)
-			userLoadExist = true
-		case strings.HasPrefix(arg, "-newchain:"):
-			chainNewStr = strings.Replace(arg, "-newchain:", "", 1)
-			chainNewExist = true
-		case strings.HasPrefix(arg, "-loadchain:"):
-			chainLoadStr = strings.Replace(arg, "-loadchain:", "", 1)
-			chainLoadExist = true
-		}
-	}
-
-	if 	!(userNewExist || userLoadExist) || !(chainNewExist || chainLoadExist) || 
-		!serveExist || !addrExist {
-			panic("failed: !(userNewExist || userLoadExist)"+
-				"|| !(chainNewExist || chainLoadExist) || !serveExist || !addrExist")
-	}
-
-	Serve = serveStr
-
-	var addresses []string
-	err := json.Unmarshal([]byte(readFile(addrStr)), &addresses)
-	if err != nil {
-		panic("failed: load addresses")
-	}
-
-	var mapaddr = make(map[string]bool)
-	for _, addr := range addresses {
-		if addr == Serve {
-			continue
-		}
-		if _, ok := mapaddr[addr]; ok {
-			continue
-		}
-		mapaddr[addr] = true
-		Addresses = append(Addresses, addr)
-	}
-
-	if userNewExist {
-		User = userNew(userNewStr)
-	}
-	if userLoadExist {
-		User = userLoad(userLoadStr)
-	}
-	if User == nil {
-		panic("failed: load user")
-	}
-
-	if chainNewExist {
-		Filename = chainNewStr
-		Chain = chainNew(chainNewStr)
-	}
-	if chainLoadExist {
-		Filename = chainLoadStr
-		Chain = chainLoad(chainLoadStr)
-	}
-	if Chain == nil {
-		panic("failed: load chain")
-	}
-
-	Block = bc.NewBlock(User.Address(), Chain.LastHash())
-}
-
-func main() {
-	nt.Listen(Serve, handleServer)
-	for {
-		fmt.Scanln()
-	}
-}
-
-func chainNew(filename string) *bc.BlockChain {
-	err := bc.NewChain(filename, User.Address())
+func GeneratePrivate(bits uint) *rsa.PrivateKey {
+	priv, err := rsa.GenerateKey(rand.Reader, int(bits))
 	if err != nil {
 		return nil
 	}
-	return bc.LoadChain(filename)
+	return priv
 }
 
-func chainLoad(filename string) *bc.BlockChain {
-	chain := bc.LoadChain(filename)
-	if chain == nil {
+func GenerateRandomBytes(max uint) []byte {
+	var slice []byte = make([]byte, max)
+	_, err := rand.Read(slice)
+	if err != nil {
 		return nil
 	}
-	return chain
+	return slice
+}
+
+func HashSum(data []byte) []byte {
+	hash := sha256.Sum256(data)
+	return hash[:]
+}
+
+func Sign(priv *rsa.PrivateKey, data []byte) []byte {
+	signature, err := rsa.SignPSS(rand.Reader, priv, crypto.SHA256, data, nil)
+	if err != nil {
+		return nil
+	}
+	return signature
+}
+
+func Verify(pub *rsa.PublicKey, data, sign []byte) error {
+	return rsa.VerifyPSS(pub, crypto.SHA256, data, sign, nil)
+}
+
+func ProofOfWork(blockHash []byte, difficulty uint8, ch chan bool) uint64 {
+	var (
+		Target  = big.NewInt(1)
+		intHash = big.NewInt(1)
+		nonce   = uint64(mrand.Intn(math.MaxUint32))
+		hash    []byte
+	)
+	Target.Lsh(Target, 256-uint(difficulty))
+	for nonce < math.MaxUint64 {
+		select {
+		case <-ch:
+			if DEBUG {
+				fmt.Println()
+			}
+			return nonce
+		default:
+			hash = HashSum(bytes.Join(
+				[][]byte{
+					blockHash,
+					ToBytes(nonce),
+				},
+				[]byte{},
+			))
+			if DEBUG {
+				fmt.Printf("\rMining: %s", Base64Encode(hash))
+			}
+			intHash.SetBytes(hash)
+			if intHash.Cmp(Target) == -1 {
+				if DEBUG {
+					fmt.Println()
+				}
+				return nonce
+			}
+			nonce++
+		}
+	}
+	return nonce
+}
+
+func Base64Encode(data []byte) string {
+	return base64.StdEncoding.EncodeToString(data)
+}
+
+func Base64Decode(data string) []byte {
+	result, err := base64.StdEncoding.DecodeString(data)
+	if err != nil {
+		return nil
+	}
+	return result
+}
+
+func ToBytes(num uint64) []byte {
+	var data = new(bytes.Buffer)
+	err := binary.Write(data, binary.BigEndian, num)
+	if err != nil {
+		return nil
+	}
+	return data.Bytes()
+}
+
+func StringPublic(pub *rsa.PublicKey) string {
+	return Base64Encode(x509.MarshalPKCS1PublicKey(pub))
+}
+
+func ParsePublic(pubData string) *rsa.PublicKey {
+	pub, err := x509.ParsePKCS1PublicKey(Base64Decode(pubData))
+	if err != nil {
+		return nil
+	}
+	return pub
+}
+
+func StringPrivate(priv *rsa.PrivateKey) string {
+	return Base64Encode(x509.MarshalPKCS1PrivateKey(priv))
+}
+
+func ParsePrivate(privData string) *rsa.PrivateKey {
+	pub, err := x509.ParsePKCS1PrivateKey(Base64Decode(privData))
+	if err != nil {
+		return nil
+	}
+	return pub
 }
